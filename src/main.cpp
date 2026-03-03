@@ -22,8 +22,13 @@ int main() {
     /* initialize neighbor storage */
     neighbor::init();
 
-    /* initial interface discovery */
-    interfaces::checkAndUpdate(machineId);
+    /* initialize interface monitoring */
+    if (!interfaces::initMonitor(machineId)) {
+        LOG_ERROR("Failed to initialize interface monitor");
+        ipc::cleanup();
+        return 1;
+    }
+
     if (interfaces::monitoredEthInterfaces.empty()) {
         LOG_ERROR("No active Ethernet interfaces found!");
         ipc::cleanup();
@@ -38,9 +43,9 @@ int main() {
     while (true) {
         time_t now = time(nullptr);
 
-        /* check interfaces, check neigbour timeout and send */
+        /* check interfaces, check neighbour timeout and send */
         if (now - last_send_time >= SEND_INTERVAL_SEC) {
-            interfaces::checkAndUpdate(machineId);
+            interfaces::periodicResync(now);
             neighbor::checkTimeout(now);
 
             if (interfaces::monitoredEthInterfaces.empty()) {
@@ -69,6 +74,7 @@ int main() {
         fd_set readfds;
         FD_ZERO(&readfds);
         int max_fd = 0;
+        int netlink_fd = interfaces::getNetlinkFd();
 
         for (const auto& [ifname, ethInterface] : interfaces::monitoredEthInterfaces) {
             FD_SET(ethInterface.sockfd, &readfds);
@@ -84,6 +90,13 @@ int main() {
             }
         }
 
+        if (netlink_fd >= 0) {
+            FD_SET(netlink_fd, &readfds);
+            if (netlink_fd > max_fd) {
+                max_fd = netlink_fd;
+            }
+        }
+
         /* wait for incoming packets */
         struct timeval timeout{};
         timeout.tv_sec = time_until_send;
@@ -94,6 +107,10 @@ int main() {
             continue;
         } else if (ret == 0) {
             continue; // no fd is set, loop back to sending
+        }
+
+        if (netlink_fd >= 0 && FD_ISSET(netlink_fd, &readfds)) {
+            interfaces::handleNetlinkEvents();
         }
 
         if (FD_ISSET(ipc::server_fd, &readfds)) {

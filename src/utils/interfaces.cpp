@@ -1,7 +1,14 @@
+#include <fcntl.h>
 #include "interfaces.hpp"
 
 namespace interfaces {
     std::unordered_map<std::string, MonitoredEthInterface> monitoredEthInterfaces;
+    int netlinkFd = -1;
+
+    static uint8_t storedMachineId[MACHINE_ID_LEN];
+    static time_t lastResync = 0;
+    constexpr time_t RESYNC_INTERVAL_SEC = 300;
+    constexpr size_t NETLINK_BUFFER_SIZE = 4096;
 
     static const std::unordered_map<std::string, EthInterface>& discover() {
         static std::unordered_map<std::string, EthInterface> discoveredInterfaces;
@@ -102,6 +109,36 @@ namespace interfaces {
         return sockfd;
     }
 
+    static bool setupNetlinkSocket() {
+        netlinkFd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+        if (netlinkFd < 0) {
+            LOG_ERROR("Failed to create netlink socket: " << strerror(errno));
+            return false;
+        }
+
+        int flags = fcntl(netlinkFd, F_GETFL, 0);
+        if (flags >= 0) {
+            if (fcntl(netlinkFd, F_SETFL, flags | O_NONBLOCK) < 0) {
+                LOG_WARN("Failed to set netlink socket to non-blocking mode: " << strerror(errno));
+            }
+        } else {
+            LOG_WARN("Failed to get netlink socket flags: " << strerror(errno));
+        }
+
+        struct sockaddr_nl addr{};
+        addr.nl_family = AF_NETLINK;
+        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+
+        if (bind(netlinkFd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            LOG_ERROR("Failed to bind netlink socket: " << strerror(errno));
+            close(netlinkFd);
+            netlinkFd = -1;
+            return false;
+        }
+
+        return true;
+    }
+
     static void addOrUpdate(const EthInterface& ethInterface, const uint8_t* machineId) {
         auto it = monitoredEthInterfaces.find(ethInterface.name);
 
@@ -180,6 +217,78 @@ namespace interfaces {
             } else {
                 ++it;
             }
+        }
+    }
+
+    int getNetlinkFd() {
+        return netlinkFd;
+    }
+
+    bool initMonitor(const uint8_t* machineId) {
+        std::memcpy(storedMachineId, machineId, MACHINE_ID_LEN);
+
+        if (!setupNetlinkSocket()) {
+            return false;
+        }
+
+        checkAndUpdate(machineId);
+        lastResync = time(nullptr);
+        return true;
+    }
+
+    void handleNetlinkEvents() {
+        if (netlinkFd < 0) return;
+
+        char buf[NETLINK_BUFFER_SIZE];
+        bool needsUpdate = false;
+
+        while (true) {
+            ssize_t len = recv(netlinkFd, buf, sizeof(buf), MSG_DONTWAIT);
+            if (len < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                LOG_ERROR("Netlink recv failed: " << strerror(errno));
+                return;
+            }
+            if (len == 0) {
+                break;
+            }
+
+            size_t msg_len = static_cast<size_t>(len);
+            for (struct nlmsghdr* nh = (struct nlmsghdr*)buf; NLMSG_OK(nh, msg_len); nh = NLMSG_NEXT(nh, msg_len)) {
+                if (nh->nlmsg_type == NLMSG_DONE) break;
+                if (nh->nlmsg_type == NLMSG_ERROR) {
+                    struct nlmsgerr* err = (struct nlmsgerr*)NLMSG_DATA(nh);
+                    if (err->error != 0) {
+                        LOG_ERROR("Netlink error: " << strerror(-err->error));
+                    }
+                    continue;
+                }
+
+                switch (nh->nlmsg_type) {
+                    case RTM_NEWLINK:
+                    case RTM_DELLINK:
+                    case RTM_NEWADDR:
+                    case RTM_DELADDR:
+                        needsUpdate = true;
+                        break;
+                    default:
+                        break;
+                }
+            }
+        }
+
+        if (needsUpdate) {
+            checkAndUpdate(storedMachineId);
+            lastResync = time(nullptr);
+        }
+    }
+
+    void periodicResync(time_t now) {
+        if (now - lastResync >= RESYNC_INTERVAL_SEC) {
+            checkAndUpdate(storedMachineId);
+            lastResync = now;
         }
     }
 
