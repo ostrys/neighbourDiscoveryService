@@ -45,6 +45,47 @@ Total: 66 bytes (14-byte Ethernet header + 52-byte payload).
 
 Machine ID is read from `/etc/machine-id` (Ubuntu standard).
 
+### Neighbor Discovery Internals
+
+#### Interface enumeration (kernel view)
+The service refreshes its interface list with `getifaddrs()` before each send interval. Interfaces are kept only when:
+- Flags include `IFF_UP` **and** `IFF_RUNNING`
+- Name is not `lo`
+- Link-layer data is present (MAC + `ifindex` from `AF_PACKET`)
+- Optional address data is collected from `AF_INET` (IPv4) and `AF_INET6` (IPv6)
+
+| ifindex | name | MAC | IPv4 | IPv6 |
+|---------|------|-----|------|------|
+| 2 | eth0 | aa:bb:cc:dd:ee:ff | 192.0.2.10/24 | 2001:db8::1234/64 |
+
+Interfaces missing link-layer info are dropped, and disappearing interfaces are closed and removed.
+
+#### Discovery sockets and syscalls
+Each monitored interface owns a raw socket pinned to that device and protocol:
+
+| Step | Syscall/API | Key parameters / behavior |
+|------|-------------|---------------------------|
+| 1 | `socket(AF_PACKET, SOCK_RAW, htons(0x88B5))` | Raw L2 socket for EtherType `0x88B5` (NEIGHBOR_DISC). |
+| 2 | `setsockopt(SO_RCVBUF, 8 MB)` | Enlarges per-interface receive buffer to a theoretical ~127,100 frames (8 MiB = 8,388,608 bytes; calculation uses the NeighborPayload-sized frame: 14-byte header + 52-byte payload = 66 bytes, above the 64-byte Ethernet minimum; ignores per-packet kernel overhead such as sk_buff metadata). |
+| 3 | `bind(sock, sockaddr_ll{ sll_ifindex, proto=0x88B5 })` | Pins socket to interface index + EtherType. |
+| 4 | `select()` main loop | Watches all interface sockets + IPC server with timeout to next send. |
+| 5 | `recv(MSG_DONTWAIT)` up to `MAX_PKTS_PER_ITER=100000` | Non-blocking drain per interface; ceiling (`MAX_PKTS_PER_ITER` in `common.hpp`) intentionally below the theoretical ~127,100-frame buffer (≈27,100-frame headroom—~21.3% of capacity or ~27.1% of the 100k drain limit) to cap per-iteration work and avoid per-interface starvation while still draining large bursts. |
+| 6 | `sendto()` | Broadcasts frame every `SEND_INTERVAL_SEC=5s` per interface using `sockaddr_ll` with broadcast MAC. |
+
+#### Packet layout and flow
+- Destination MAC: ff:ff:ff:ff:ff:ff (broadcast)
+- Source MAC: interface MAC
+- EtherType: `0x88B5` (NEIGHBOR_DISC)
+- Payload (`NeighborPayload`, 52 B):
+  - `machineId` (32 B) read from `/etc/machine-id`
+  - IPv4 (4 B, network byte order via `htonl`)
+  - IPv6 (16 B raw bytes)
+
+Flow example:
+1. Every 5 seconds, the service rebuilds the interface list, regenerates frames with the current MAC/IP data, and calls `sendto()` on each bound raw socket.
+2. The continuous `select()` loop wakes whenever discovery frames arrive; for each ready interface socket it drains up to `MAX_PKTS_PER_ITER` incoming frames with `recv(MSG_DONTWAIT)` and forwards valid neighbor payloads to storage.
+3. After receives are drained or the timeout expires, control returns to the top of the loop; the next wake aligns with either another incoming frame or the next 5-second send deadline while also polling the IPC file descriptor.
+
 
 ## Project Structure
 
@@ -149,4 +190,3 @@ The service is optimized for 10,000+ neighbors:
 - **No exceptions**: Error handling via return codes
 - **C++17**: Standard library only (libstdc++)
 - **Platform**:  Ubuntu 24.04.3 LTS (at time of writing latest Ubuntu LTS, tested using VirtualBox)
-
