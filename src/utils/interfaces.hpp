@@ -9,6 +9,9 @@
 #include <netpacket/packet.h>
 #include <unistd.h>
 #include <cerrno>
+#include <ctime>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
 
 #include "common.hpp"
 #include "utils/utils.hpp"
@@ -40,5 +43,11 @@ struct MonitoredEthInterface {
 
 namespace interfaces {
     extern std::unordered_map<std::string, MonitoredEthInterface> monitoredEthInterfaces;
+    extern int netlinkFd;
+
+    bool initMonitor(const uint8_t* machineId);
+    void handleNetlinkEvents();
+    void periodicResync(time_t now);
+    int getNetlinkFd();
     void checkAndUpdate(const uint8_t* machineId);
 }
